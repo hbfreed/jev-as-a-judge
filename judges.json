@@ -1,0 +1,15 @@
+{
+  "reward": "~typesafe/jev-latest",
+  "reasoning_effort": "low",
+  "judges": [
+    "anthropic/claude-haiku-5.5",
+    "openai/gpt-6-luna",
+    "deepseek/deepseek-v4.1-flash-1017",
+    "z-ai/glm-5.3-flash",
+    "inception/mercury-3"
+  ],
+  "decision_judges": [
+    "~typesafe/jev-latest",
+    "openai/gpt-6-luna-decisions"
+  ]
+}

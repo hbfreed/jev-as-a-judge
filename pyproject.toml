@@ -1,0 +1,21 @@
+[project]
+name = "jev-as-a-judge"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "httpx",
+    "json-repair",
+    "tinker-cookbook==0.5.8",
+    "wandb>=0.31.0",
+    "torch>=2.14.1",
+    "openai>=3.37.0",
+]
+
+# Tinker trains remotely; torch only comes in for tokenizer/renderer code, so skip the CUDA wheels.
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
