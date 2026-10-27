@@ -122,6 +122,9 @@ def generate(llm, tasks: list[Task], n: int, temperature: float, cfg: Config, lo
     sleep so the trainer has the GPU."""
     import vllm
 
+    # The trainer's freed activations stay cached by PyTorch; hand them back before vLLM
+    # reclaims its weights and KV cache, or the wake-up runs out of memory.
+    torch.cuda.empty_cache()
     llm.wake_up()
     try:
         return llm.chat(
