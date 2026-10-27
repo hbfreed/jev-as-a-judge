@@ -4,18 +4,20 @@ Comparing Jev to other models for scoring RL rubrics
 
 ## Setup
 
-The tasks are [WritingBench](https://github.com/X-PLUG/WritingBench), ported from Prime Intellect's
-`prime-environments`: long-form writing queries (we use the ~470 English ones under 8000 chars),
-each with its own 5-criterion, 1-10 rubric. Training is LoRA RL on [Tinker](https://thinkingmachines.ai/tinker/).
+The task is [HumanAgencyBench](https://arxiv.org/abs/2509.08494) (via Prime Intellect's
+`agency_bench` env): 3,000 short-answer prompts across six dimensions of supporting a user's agency,
+each graded by a rubric of issues with point deductions. Its dataset also ships 75,000 replies from
+25 models graded by o3, which we use to check judges against o3 before training.
 
-- `writing_bench.py`: the tasks (deterministic 80/20 train/test split) and the judges. A chat judge scores all 5 criteria in one JSON call; a decision judge (e.g. Jev) gets one `score` question per criterion through OpenRouter's Decisions API. Each judge's score is the mean criterion score in [0, 1].
-- `judges.json`: the panel. `reward` is the judge whose score trains the policy; `judges` lists chat models, `decision_judges` lists decision models, and `reasoning_effort` applies to the OpenRouter chat judges. `anthropic/*` models go to the Anthropic API, everything else to OpenRouter.
-- `train.py`: training rollouts are graded by the `reward` judge alone. At steps 0, 15 and 30, 20 test tasks are graded by the full panel. wandb gets reward, each judge's score, per-criterion scores, failure rate, latency and cost, plus truncation and reply length. `runs/<name>/` gets per-step HTML transcripts and rollout JSONL.
+- `agency_bench.py`: tasks (deterministic 80/20 train/test split), judges, and `check`. Chat judges get the benchmark's own judge prompt; decision models such as Jev get one yes/no question per issue through OpenRouter's Decisions API and score the expected deduction.
+- `rubrics.json`: the six rubrics (issues, deductions, judge prompts), parsed from Prime's port.
+- `judges.json`: the judge panel. `reward` is the default reward judge; `judges` lists chat models, `decision_judges` decision models; `anthropic/*` goes to the Anthropic API, the rest to OpenRouter.
+- `train.py`: GRPO with LoRA on vLLM rollouts (ported from rl-experiments), one reward judge per run, each run on its own GPU (vLLM sleeps while the trainer runs). Held-out evals graded by the full panel at step 0 and every 25 steps; rollouts, eval replies with every judge's scores, metrics and checkpoints are saved under `runs/` and `checkpoints/`.
 
-Keys in `.env`: `OPENROUTER_API_KEY`, `ANTHROPIC_API_KEY`, `TINKER_API_KEY`, `WANDB_API_KEY`.
+Keys in `.env`: `OPENROUTER_API_KEY`, `ANTHROPIC_API_KEY`, `WANDB_API_KEY`.
 
 ```bash
-uv sync
-uv run --env-file .env train.py --help   # knobs: model, LoRA rank, LR, group sizes, steps, eval cadence
-uv run --env-file .env train.py
+uv run --env-file .env agency_bench.py check --prompts 60 --replies 8   # judges vs o3 (laptop is fine)
+uv sync --extra train                                                     # GPU box only
+uv run --env-file .env train.py --rewards jev_latest,mercury_3            # one run per GPU
 ```
