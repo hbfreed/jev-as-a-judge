@@ -239,9 +239,12 @@ def evaluate(step, llm, panel, tasks, cfg, lora_request, loop, out_dir: Path) ->
     t = time.perf_counter()
     outs = generate(llm, tasks, 1, 0.0, cfg, lora_request)
     replies = [o.outputs[0].text for o in outs]
-    results = loop.run_until_complete(asyncio.gather(*(
-        grade_all(judge, list(zip(tasks, replies)), cfg.judge_concurrency) for judge in panel
-    )))
+    async def grade_panel():  # gather inside a coroutine, so its future belongs to `loop`
+        return await asyncio.gather(*(
+            grade_all(judge, list(zip(tasks, replies)), cfg.judge_concurrency) for judge in panel
+        ))
+
+    results = loop.run_until_complete(grade_panel())
     metrics = {
         "eval/trunc_rate": statistics.mean(o.outputs[0].finish_reason == "length" for o in outs),
         "eval/mean_len": statistics.mean(len(o.outputs[0].token_ids) for o in outs),
