@@ -8,12 +8,12 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# The GPU training stack (stormtrooper): `uv sync --extra train`. Pinned to what rl-experiments
-# runs; torch is left to vLLM, which hard-pins it.
+# The GPU training stack (stormtrooper): `uv sync --extra train`. torch is left to vLLM, which
+# hard-pins it.
 train = [
     "bitsandbytes>=0.49.2",
     "peft==0.19.1",
     "transformers",
-    "vllm==0.24.0",
+    "vllm==0.31.0",
     "wandb",
 ]
