@@ -3,14 +3,17 @@
 Ported from rl-experiments/train.py: vLLM samples each GRPO group, a PEFT LoRA trainer updates the
 policy, and each step's adapter reaches vLLM through tmpfs and an in-place LoRARequest reload
 (~0.5 s, no base-weight copy). vLLM and the trainer share one GPU: the engine sleeps (weights
-offloaded to CPU, KV cache freed) while the trainer runs, so each GPU hosts one whole run.
+offloaded to CPU, KV cache freed) while the trainer runs, so a GPU hosts a whole run. A run can
+also span several GPUs: one process per GPU, each with its own engine and trainer replica taking
+a share of every step's prompts, with LoRA gradients summed across processes.
 
 Defaults follow Prime Intellect's prime-rl examples for Qwen3-4B-Instruct-2507 (LoRA, lr 1e-5,
 16 prompts x 16 rollouts, 200 steps). Every `eval_every` steps, starting at step 0, held-out
 prompts are answered greedily and graded by the whole judges.json panel.
 
-    uv run --env-file .env train.py --reward jev_latest                 # one run
-    uv run --env-file .env train.py --rewards jev_latest,mercury_3      # one run per GPU
+    uv run --env-file .env train.py --reward jev_latest                     # one run, one GPU
+    uv run --env-file .env train.py --reward jev_latest --gpus-per-run 3    # one run on 3 GPUs
+    uv run --env-file .env train.py --rewards jev_latest,mercury_3          # one run per GPU
 """
 
 import argparse
@@ -236,6 +239,77 @@ def iter_prompt_batches(tasks: list[Task], batch_size: int, seed: int):
         pos += batch_size
 
 
+# --- distributed -------------------------------------------------------------------------------
+
+# Set by `launch` for a run spread over several GPUs. Only LoRA gradients and small stats cross
+# processes, over gloo on the CPU (~16M parameters: a fraction of a second per step), which keeps
+# torch.distributed clear of the GPUs vLLM manages.
+RANK = int(os.environ.get("JEV_RANK", "0"))
+WORLD = int(os.environ.get("JEV_WORLD_SIZE", "1"))
+
+
+def init_dist() -> None:
+    if WORLD > 1:
+        import torch.distributed as dist
+
+        dist.init_process_group(
+            "gloo", init_method=f"tcp://127.0.0.1:{os.environ['JEV_DIST_PORT']}", rank=RANK, world_size=WORLD
+        )
+
+
+def broadcast_object(obj):
+    if WORLD == 1:
+        return obj
+    import torch.distributed as dist
+
+    box = [obj]
+    dist.broadcast_object_list(box, src=0)
+    return box[0]
+
+
+def gather_objects(obj) -> list:
+    if WORLD == 1:
+        return [obj]
+    import torch.distributed as dist
+
+    out = [None] * WORLD
+    dist.all_gather_object(out, obj)
+    return out
+
+
+def sum_across_ranks(*values: float) -> list[float]:
+    if WORLD == 1:
+        return list(values)
+    import torch.distributed as dist
+
+    t = torch.tensor(values, dtype=torch.float64)
+    dist.all_reduce(t)
+    return t.tolist()
+
+
+def sync_lora(params, grads: bool) -> None:
+    """Sum the trainable parameters' gradients across ranks (grads=True), or copy rank 0's
+    parameters to every rank (grads=False, once at start, so the replicas begin identical)."""
+    if WORLD == 1:
+        return
+    import torch.distributed as dist
+
+    if grads:
+        flat = torch.cat([(p.grad if p.grad is not None else torch.zeros_like(p)).reshape(-1).float().cpu() for p in params])
+        dist.all_reduce(flat)
+    else:
+        flat = torch.cat([p.detach().reshape(-1).float().cpu() for p in params])
+        dist.broadcast(flat, src=0)
+    offset = 0
+    for p in params:
+        chunk = flat[offset : offset + p.numel()].view(p.shape).to(p.device, p.dtype)
+        if grads:
+            p.grad = chunk
+        else:
+            p.data.copy_(chunk)
+        offset += p.numel()
+
+
 # --- eval ----------------------------------------------------------------------------------------
 
 
@@ -246,39 +320,50 @@ def eval_tasks(cfg: Config) -> list[Task]:
     return [t for dim in sorted(RUBRICS) for t in [t for t in test if t.dimension == dim][:per_dim]]
 
 
-def evaluate(step, llm, panel, tasks, cfg, lora_request, loop, out_dir: Path) -> dict:
-    """Greedy replies to held-out prompts, graded by every judge. Saves each reply with all judge
-    scores to eval_step_<step>.jsonl and returns eval/* metrics."""
+def evaluate(step, llm, panel, tasks, cfg, lora_request, loop, out_dir: Path) -> dict | None:
+    """Greedy replies to held-out prompts (each rank answers its share), graded by every judge.
+    Rank 0 saves each reply with all judge scores to eval_step_<step>.jsonl and returns eval/*
+    metrics; other ranks return None."""
     t = time.perf_counter()
-    outs, _ = generate(llm, tasks, 1, 0.0, cfg, lora_request)
+    shard = tasks[RANK::WORLD]
+    outs, _ = generate(llm, shard, 1, 0.0, cfg, lora_request)
     replies = [o.outputs[0].text for o in outs]
+
     async def grade_panel():  # gather inside a coroutine, so its future belongs to `loop`
         return await asyncio.gather(*(
-            grade_all(judge, list(zip(tasks, replies)), cfg.judge_concurrency) for judge in panel
+            grade_all(judge, list(zip(shard, replies)), cfg.judge_concurrency) for judge in panel
         ))
 
     results = loop.run_until_complete(grade_panel())
+    records = [
+        {
+            "task_id": task.id, "dimension": task.dimension, "reply": reply,
+            "truncated": out.outputs[0].finish_reason == "length", "tokens": len(out.outputs[0].token_ids),
+            "judges": {j.name: (None if res[i] is None else {"score": res[i][0], **res[i][1]})
+                       for j, res in zip(panel, results)},
+        }
+        for i, (task, reply, out) in enumerate(zip(shard, replies, outs))
+    ]
+    records = [r for rank_records in gather_objects(records) for r in rank_records]
+    if RANK != 0:
+        return None
+    with (out_dir / f"eval_step_{step}.jsonl").open("w") as f:
+        for r in records:
+            f.write(json.dumps(r) + "\n")
     metrics = {
-        "eval/trunc_rate": statistics.mean(o.outputs[0].finish_reason == "length" for o in outs),
-        "eval/mean_len": statistics.mean(len(o.outputs[0].token_ids) for o in outs),
+        "eval/trunc_rate": statistics.mean(r["truncated"] for r in records),
+        "eval/mean_len": statistics.mean(r["tokens"] for r in records),
     }
-    for judge, res in zip(panel, results):
-        ok = [r for r in res if r is not None]
-        metrics[f"eval/{judge.name}/failed"] = 1 - len(ok) / len(res)
+    for judge in panel:
+        ok = [r["judges"][judge.name] for r in records if r["judges"][judge.name] is not None]
+        metrics[f"eval/{judge.name}/failed"] = 1 - len(ok) / len(records)
         if ok:
-            metrics[f"eval/{judge.name}"] = statistics.mean(r[0] for r in ok)
-            metrics[f"eval/{judge.name}/latency_s"] = statistics.median(r[1][f"{judge.name}/latency_s"] for r in ok)
+            metrics[f"eval/{judge.name}"] = statistics.mean(o["score"] for o in ok)
+            metrics[f"eval/{judge.name}/latency_s"] = statistics.median(o[f"{judge.name}/latency_s"] for o in ok)
     # Every policy looks good to the judge it trained on; compare runs on the rest of the panel.
     heldout = [metrics[f"eval/{j.name}"] for j in panel if not j.weight and f"eval/{j.name}" in metrics]
     if heldout:
         metrics["eval/heldout_mean"] = statistics.mean(heldout)
-    with (out_dir / f"eval_step_{step}.jsonl").open("w") as f:
-        for i, (task, reply) in enumerate(zip(tasks, replies)):
-            f.write(json.dumps({
-                "task_id": task.id, "dimension": task.dimension, "reply": reply,
-                "judges": {j.name: (None if res[i] is None else {"score": res[i][0], **res[i][1]})
-                           for j, res in zip(panel, results)},
-            }) + "\n")
     metrics["eval/eval_s"] = time.perf_counter() - t
     print(f"  [eval] step {step}: " + " | ".join(
         f"{j.name} {metrics.get(f'eval/{j.name}', float('nan')):.3f}" for j in panel
@@ -295,35 +380,44 @@ def train(cfg: Config) -> None:
 
     panel = load_judges(cfg.judges_file, cfg.reward)
     reward_judge = next(j for j in panel if j.weight)
-    run_name = (
-        f"{reward_judge.name}-{cfg.model.split('/')[-1].lower()}-r{cfg.lora_rank}-lr{cfg.lr:g}"
-        f"-{time.strftime('%m%d-%H%M')}"
-    )
-    out_dir = Path("runs") / run_name
-    out_dir.mkdir(parents=True)
-    (out_dir / "config.json").write_text(json.dumps(asdict(cfg) | {"run_name": run_name}, indent=2))
-
     train_tasks = load_tasks("train")
     held_out = eval_tasks(cfg)
     print(f"[data] {len(train_tasks)} train prompts, {len(held_out)} eval prompts; reward = {reward_judge.name}", flush=True)
 
-    # Build the engine first, while the GPU is empty, then sleep it so the trainer can load.
+    # Build the engine first, while the GPU is empty, and before torch.distributed starts, so
+    # vLLM's engine process never sees our process group; then sleep it so the trainer can load.
     llm = build_engine(cfg)
     llm.sleep(level=1)
     print("[ready] vLLM engine up", flush=True)
+    init_dist()
+
+    run_name = out_dir = None
+    if RANK == 0:
+        run_name = (
+            f"{reward_judge.name}-{cfg.model.split('/')[-1].lower()}-r{cfg.lora_rank}-lr{cfg.lr:g}"
+            f"{f'-x{WORLD}' if WORLD > 1 else ''}-{time.strftime('%m%d-%H%M')}"
+        )
+        (Path("runs") / run_name).mkdir(parents=True)
+        (Path("runs") / run_name / "config.json").write_text(
+            json.dumps(asdict(cfg) | {"run_name": run_name, "gpus": WORLD}, indent=2)
+        )
+    run_name = broadcast_object(run_name)  # also holds the other ranks until rank 0 made out_dir
+    out_dir = Path("runs") / run_name
+
     model, tokenizer = load_policy(cfg)
     trainable = [p for p in model.parameters() if p.requires_grad]
+    sync_lora(trainable, grads=False)
     optimizer = bnb.optim.AdamW8bit(trainable, lr=cfg.lr, betas=(0.9, 0.95), weight_decay=0.0)
     scheduler = get_constant_schedule_with_warmup(optimizer, num_warmup_steps=cfg.warmup_steps)
-    adapter_dir = f"/dev/shm/jev-as-a-judge/{run_name}"
+    adapter_dir = f"/dev/shm/jev-as-a-judge/{run_name}/rank{RANK}"
     lora_request = sync_adapter(model, adapter_dir)
     # One loop for the whole run: the judges' HTTP clients are bound to the loop they first ran on.
     loop = asyncio.new_event_loop()
 
-    if cfg.use_wandb:
+    if cfg.use_wandb and RANK == 0:
         import wandb
 
-        wandb.init(project=cfg.wandb_project, name=run_name, config=asdict(cfg))
+        wandb.init(project=cfg.wandb_project, name=run_name, config=asdict(cfg) | {"gpus": WORLD})
 
     def log(metrics: dict, step: int) -> None:
         if cfg.use_wandb:
@@ -331,16 +425,19 @@ def train(cfg: Config) -> None:
         with (out_dir / "metrics.jsonl").open("a") as f:
             f.write(json.dumps({"step": step, **metrics}) + "\n")
 
+    # Every rank draws the same batch and takes its share of the prompts.
     prompt_batches = iter_prompt_batches(train_tasks, cfg.prompts_per_step, cfg.seed)
     for step in range(cfg.num_steps + 1):
         if cfg.eval_every and (step % cfg.eval_every == 0 or step == cfg.num_steps):
-            log(evaluate(step, llm, panel, held_out, cfg, lora_request, loop, out_dir), step)
+            eval_metrics = evaluate(step, llm, panel, held_out, cfg, lora_request, loop, out_dir)
+            if RANK == 0:
+                log(eval_metrics, step)
         if step == cfg.num_steps:
             break
 
         t_step = time.perf_counter()
         torch.cuda.reset_peak_memory_stats()
-        batch = next(prompt_batches)
+        batch = next(prompt_batches)[RANK::WORLD]
         t = time.perf_counter()
         outs, handoff_s = generate(llm, batch, cfg.group_size, cfg.temperature, cfg, lora_request)
         gen_s = time.perf_counter() - t
@@ -372,8 +469,12 @@ def train(cfg: Config) -> None:
             [k for k in range(len(flat)) if adv_list[k] == 0.0 and truncated[k] > 0.5 and not failed[k]]
             if cfg.kl_coef > 0 and cfg.mask_truncated else []
         )
-        normalizer = max(1, sum(len(completion_ids[k]) for k in live))
-        kl_normalizer = max(1, sum(len(completion_ids[k]) for k in fwd_rows))
+        # Normalize by the whole step's token counts, across ranks, so the summed gradients equal
+        # what one GPU would have computed for the full batch.
+        trained_toks, fwd_toks, global_fwd_rows = sum_across_ranks(
+            sum(len(completion_ids[k]) for k in live), sum(len(completion_ids[k]) for k in fwd_rows), len(fwd_rows)
+        )
+        normalizer, kl_normalizer = max(1, trained_toks), max(1, fwd_toks)
         lengths = [len(p) + len(c) for p, c in zip(prompt_ids, completion_ids)]
 
         optimizer.zero_grad()
@@ -387,127 +488,165 @@ def train(cfg: Config) -> None:
             )
             loss.backward()
             loss_sum, logprob_sum, kl_sum = loss_sum + loss.detach(), logprob_sum + mb_logprobs, kl_sum + mb_kl
-        grad_norm = torch.nn.utils.clip_grad_norm_(trainable, cfg.max_grad_norm)
-        optimizer.step()
+        grad_norm = 0.0
+        if global_fwd_rows:  # an all-tied step has no gradient anywhere; don't let Adam momentum move it
+            sync_lora(trainable, grads=True)
+            grad_norm = torch.nn.utils.clip_grad_norm_(trainable, cfg.max_grad_norm).item()
+            optimizer.step()
         scheduler.step()
 
         t = time.perf_counter()
         lora_request = sync_adapter(model, adapter_dir)
         sync_s = time.perf_counter() - t
 
-        ok = [g for g in graded if g is not None]
-        gen_toks = sum(len(c) for c in completion_ids)
-        metrics = {
-            "train/reward": statistics.mean(g[0] for g in ok) if ok else float("nan"),
-            "train/reward_std": statistics.pstdev([g[0] for g in ok]) if ok else float("nan"),
-            "train/trunc_rate": truncated.mean().item(),
-            "train/mean_completion_len": gen_toks / len(flat),
-            "train/token_entropy": -logprob_sum.item() / max(1, sum(len(completion_ids[k]) for k in fwd_rows)),
-            "train/zero_adv_frac": 1 - len(live) / len(flat),
-            "train/kl": kl_sum.item() / kl_normalizer,
-            "train/loss": loss_sum.item(),
-            "train/grad_norm": grad_norm.item(),
-            "train/lr": scheduler.get_last_lr()[0],
-            "judge/failed": failed.float().mean().item(),
-            "judge/latency_s": statistics.median(g[1][f"{reward_judge.name}/latency_s"] for g in ok) if ok else float("nan"),
-            "judge/cost": sum(g[1].get(f"{reward_judge.name}/cost", 0.0) for g in ok),
-            "perf/gen_s": gen_s,
-            "perf/handoff_s": handoff_s,
-            "perf/score_s": score_s,
-            "perf/sync_s": sync_s,
-            "perf/step_s": time.perf_counter() - t_step,
-            "perf/gen_tok_per_s": gen_toks / gen_s,
-            "perf/peak_mem_gb": torch.cuda.max_memory_allocated() / 1e9,
-        }
-        log(metrics, step)
-        with (out_dir / "rollouts.jsonl").open("a") as f:
+        with (out_dir / f"rollouts_rank{RANK}.jsonl").open("a") as f:
             for (task, _, c), g in zip(flat, graded):
                 f.write(json.dumps({
                     "step": step, "task_id": task.id, "dimension": task.dimension, "reply": c.text,
                     "truncated": c.finish_reason == "length", "reward": None if g is None else g[0],
                 }) + "\n")
-        print(
-            f"step {step:4d} | reward {metrics['train/reward']:.3f} | trunc {metrics['train/trunc_rate']:.2f} "
-            f"| len {metrics['train/mean_completion_len']:.0f} | ent {metrics['train/token_entropy']:.2f} "
-            f"| kl {metrics['train/kl']:.4f} | zero_adv {metrics['train/zero_adv_frac']:.2f} "
-            f"| gen {gen_s:.0f}s | score {score_s:.0f}s | step {metrics['perf/step_s']:.0f}s "
-            f"| peak {metrics['perf/peak_mem_gb']:.1f}GB",
-            flush=True,
-        )
+        ranks = gather_objects({
+            "rewards": [g[0] for g in graded if g is not None],
+            "latency": [g[1][f"{reward_judge.name}/latency_s"] for g in graded if g is not None],
+            "cost": sum(g[1].get(f"{reward_judge.name}/cost", 0.0) for g in graded if g is not None),
+            "n": len(flat), "failed": int(failed.sum()), "truncated": float(truncated.sum()),
+            "gen_toks": sum(len(c) for c in completion_ids), "live": len(live),
+            "logprob_sum": logprob_sum.item(), "kl_sum": kl_sum.item(), "loss": loss_sum.item(),
+            "gen_s": gen_s, "handoff_s": handoff_s, "score_s": score_s, "sync_s": sync_s,
+            "peak": torch.cuda.max_memory_allocated() / 1e9,
+        })
+
+        if RANK == 0:
+            rew = [r for s in ranks for r in s["rewards"]]
+            lat = [x for s in ranks for x in s["latency"]]
+            n = sum(s["n"] for s in ranks)
+            gen_toks = sum(s["gen_toks"] for s in ranks)
+            slowest = lambda key: max(s[key] for s in ranks)
+            metrics = {
+                "train/reward": statistics.mean(rew) if rew else float("nan"),
+                "train/reward_std": statistics.pstdev(rew) if rew else float("nan"),
+                "train/trunc_rate": sum(s["truncated"] for s in ranks) / n,
+                "train/mean_completion_len": gen_toks / n,
+                "train/token_entropy": -sum(s["logprob_sum"] for s in ranks) / kl_normalizer,
+                "train/zero_adv_frac": 1 - sum(s["live"] for s in ranks) / n,
+                "train/kl": sum(s["kl_sum"] for s in ranks) / kl_normalizer,
+                "train/loss": sum(s["loss"] for s in ranks),
+                "train/grad_norm": grad_norm,
+                "train/lr": scheduler.get_last_lr()[0],
+                "judge/failed": sum(s["failed"] for s in ranks) / n,
+                "judge/latency_s": statistics.median(lat) if lat else float("nan"),
+                "judge/cost": sum(s["cost"] for s in ranks),
+                "perf/gen_s": slowest("gen_s"),
+                "perf/handoff_s": slowest("handoff_s"),
+                "perf/score_s": slowest("score_s"),
+                "perf/sync_s": slowest("sync_s"),
+                "perf/step_s": time.perf_counter() - t_step,
+                "perf/gen_tok_per_s": gen_toks / slowest("gen_s"),
+                "perf/peak_mem_gb": slowest("peak"),
+            }
+            log(metrics, step)
+            print(
+                f"step {step:4d} | reward {metrics['train/reward']:.3f} | trunc {metrics['train/trunc_rate']:.2f} "
+                f"| len {metrics['train/mean_completion_len']:.0f} | ent {metrics['train/token_entropy']:.2f} "
+                f"| kl {metrics['train/kl']:.4f} | zero_adv {metrics['train/zero_adv_frac']:.2f} "
+                f"| gen {metrics['perf/gen_s']:.0f}s | score {metrics['perf/score_s']:.0f}s "
+                f"| step {metrics['perf/step_s']:.0f}s | peak {metrics['perf/peak_mem_gb']:.1f}GB",
+                flush=True,
+            )
 
         if (step + 1) % cfg.ckpt_every == 0 or step + 1 == cfg.num_steps:
-            # Write to a temp dir and rename into place, so an interrupt can't leave a half-written checkpoint.
-            ckpt = Path("checkpoints") / run_name / f"step_{step + 1}"
-            tmp = ckpt.with_name(ckpt.name + ".tmp")
-            shutil.rmtree(tmp, ignore_errors=True)
-            model.save_pretrained(tmp)
-            torch.save({"optimizer": optimizer.state_dict(), "scheduler": scheduler.state_dict(),
-                        "completed_steps": step + 1}, tmp / "trainer_state.pt")
-            shutil.rmtree(ckpt, ignore_errors=True)
-            tmp.rename(ckpt)
+            # The replicas apply identical updates; check they haven't drifted apart.
+            sums = gather_objects(sum(p.detach().float().sum().item() for p in trainable))
+            if max(sums) - min(sums) > 1e-3 * max(1.0, abs(sums[0])):
+                print(f"  [warn] LoRA replicas differ across ranks: {sums}", flush=True)
+            if RANK == 0:
+                # Write to a temp dir and rename into place, so an interrupt can't leave a half-written checkpoint.
+                ckpt = Path("checkpoints") / run_name / f"step_{step + 1}"
+                tmp = ckpt.with_name(ckpt.name + ".tmp")
+                shutil.rmtree(tmp, ignore_errors=True)
+                model.save_pretrained(tmp)
+                torch.save({"optimizer": optimizer.state_dict(), "scheduler": scheduler.state_dict(),
+                            "completed_steps": step + 1}, tmp / "trainer_state.pt")
+                shutil.rmtree(ckpt, ignore_errors=True)
+                tmp.rename(ckpt)
 
     # Exiting with the engine asleep makes vLLM's teardown fail on its offloaded memory, which
     # would mark a finished run as failed.
     torch.cuda.empty_cache()
     llm.wake_up()
-    if cfg.use_wandb:
+    if cfg.use_wandb and RANK == 0:
         wandb.finish()
+    if WORLD > 1:
+        import torch.distributed as dist
+
+        dist.destroy_process_group()
 
 
 # --- launcher ----------------------------------------------------------------------------------
 
 
-def launch(rewards: list[str], argv: list[str]) -> None:
-    """One `train.py --reward <judge>` process per GPU. Engine startup is the PSU's dangerous
-    moment (rl-experiments EXPERIMENTS.md §8), so each engine comes up before the next boots."""
+def launch(rewards: list[str], gpus_per_run: int, argv: list[str]) -> None:
+    """Runs `train.py --reward <judge>` for each reward judge on its own `gpus_per_run` GPUs, one
+    process per GPU. Engine startup is the PSU's dangerous moment (rl-experiments EXPERIMENTS.md
+    §8), so each process's engine comes up before the next one boots."""
     visible = os.environ.get("CUDA_VISIBLE_DEVICES")
     gpus = visible.split(",") if visible else [str(i) for i in range(torch.cuda.device_count())]
-    if len(rewards) > len(gpus):
-        raise SystemExit(f"{len(rewards)} runs but only {len(gpus)} GPUs")
+    if len(rewards) * gpus_per_run > len(gpus):
+        raise SystemExit(f"{len(rewards)} runs x {gpus_per_run} GPUs each, but only {len(gpus)} GPUs")
     log_dir = Path("runs") / f"launch-{time.strftime('%m%d-%H%M')}"
     log_dir.mkdir(parents=True)
     procs = {}
-    for gpu, reward in zip(gpus, rewards):
-        log_path = log_dir / f"{reward}.log"
-        with log_path.open("w") as log_file:
-            procs[reward] = proc = subprocess.Popen(
-                [sys.executable, __file__, *argv, "--reward", reward],
-                env=os.environ | {"CUDA_VISIBLE_DEVICES": gpu},
-                stdout=log_file, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
-            )
-        print(f"{reward}: GPU {gpu}, log {log_path}", flush=True)
-        deadline = time.time() + 1800
-        while proc.poll() is None and "[ready]" not in log_path.read_text() and time.time() < deadline:
-            time.sleep(5)
-        time.sleep(30)
-    for reward, proc in procs.items():
-        print(f"{reward}: exit {proc.wait()}", flush=True)
+    for j, reward in enumerate(rewards):
+        for rank in range(gpus_per_run):
+            gpu = gpus[j * gpus_per_run + rank]
+            name = reward if gpus_per_run == 1 else f"{reward}-rank{rank}"
+            log_path = log_dir / f"{name}.log"
+            env = os.environ | {
+                "CUDA_VISIBLE_DEVICES": gpu, "JEV_RANK": str(rank),
+                "JEV_WORLD_SIZE": str(gpus_per_run), "JEV_DIST_PORT": str(29500 + j),
+            }
+            with log_path.open("w") as log_file:
+                procs[name] = proc = subprocess.Popen(
+                    [sys.executable, __file__, *argv, "--reward", reward],
+                    env=env, stdout=log_file, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                )
+            print(f"{name}: GPU {gpu}, log {log_path}", flush=True)
+            deadline = time.time() + 1800
+            while proc.poll() is None and "[ready]" not in log_path.read_text() and time.time() < deadline:
+                time.sleep(5)
+            time.sleep(30)
+    for name, proc in procs.items():
+        print(f"{name}: exit {proc.wait()}", flush=True)
 
 
-def parse_args() -> tuple[Config, list[str]]:
+LAUNCH_FLAGS = ("--rewards", "--gpus-per-run")
+
+
+def parse_args() -> tuple[Config, list[str], int]:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    parser.add_argument("--rewards", default="", help="comma-separated judge names: one run per GPU, in parallel")
+    parser.add_argument("--rewards", default="", help="comma-separated judge names: one run each, in parallel")
+    parser.add_argument("--gpus-per-run", type=int, default=1, help="GPUs per run (one process each)")
     for f in fields(Config):
         kind = (lambda s: s.lower() in ("1", "true", "yes")) if f.type is bool else f.type
         parser.add_argument(f"--{f.name.replace('_', '-')}", type=kind, default=f.default)
     args = parser.parse_args()
     cfg = Config(**{f.name: getattr(args, f.name) for f in fields(Config)})
     rewards = [r for r in args.rewards.split(",") if r]
-    return cfg, rewards
+    return cfg, rewards, args.gpus_per_run
 
 
 if __name__ == "__main__":
-    cfg, rewards = parse_args()
-    if rewards:
-        # Pass every other flag through to each run unchanged.
+    cfg, rewards, gpus_per_run = parse_args()
+    if "JEV_RANK" not in os.environ and (rewards or gpus_per_run > 1):
+        # Pass every other flag through to each process unchanged.
         argv, skip = [], False
         for a in sys.argv[1:]:
             if skip:
                 skip = False
-            elif a == "--rewards":
+            elif a in LAUNCH_FLAGS:
                 skip = True
-            elif not a.startswith("--rewards="):
+            elif not a.startswith(tuple(f + "=" for f in LAUNCH_FLAGS)):
                 argv.append(a)
-        launch(rewards, argv)
+        launch(rewards or [cfg.reward], gpus_per_run, argv)
     else:
         train(cfg)
