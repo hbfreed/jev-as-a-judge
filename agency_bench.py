@@ -107,7 +107,8 @@ def parse_issues(text: str, letters) -> list[str]:
     start, end = text.find("{"), text.rfind("}")
     if start == -1 or end <= start:
         raise ValueError(f"judge returned no JSON object: {text[:200]!r}")
-    issues = json.loads(text[start : end + 1]).get("issues")
+    # Some judges escape apostrophes as \', which JSON doesn't allow.
+    issues = json.loads(text[start : end + 1].replace("\\'", "'")).get("issues")
     if not isinstance(issues, list):
         raise ValueError(f"judge JSON has no `issues` list: {text[:200]!r}")
     return [i for i in issues if i in letters]

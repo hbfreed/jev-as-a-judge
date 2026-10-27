@@ -46,6 +46,9 @@ class Config:
     lr: float = 1e-5
     warmup_steps: int = 10
     max_grad_norm: float = 1.0
+    min_group_spread: float = 0.02
+    """Groups whose rewards span less than this sit out: their (unscaled) advantages carry almost no
+    gradient but still cost a full forward and backward."""
     kl_coef: float = 0.05
     """Per-token k3 KL(policy || base), the base being this model with the adapter off; 0 disables."""
 
@@ -57,7 +60,7 @@ class Config:
     mask_truncated: bool = True
     """Zero the advantage of replies cut off by max_new_tokens (they stay in the group baseline)."""
     micro_batch_tokens: int = 8192
-    judge_concurrency: int = 32
+    judge_concurrency: int = 64
 
     eval_every: int = 25
     eval_n: int = 120
@@ -119,22 +122,27 @@ def sync_adapter(model, adapter_dir: str):
 
 def generate(llm, tasks: list[Task], n: int, temperature: float, cfg: Config, lora_request):
     """Wake the engine, sample `n` replies per task with the current adapter, and put it back to
-    sleep so the trainer has the GPU."""
+    sleep so the trainer has the GPU. Returns the outputs and the seconds spent waking and sleeping."""
     import vllm
 
+    t = time.perf_counter()
     # The trainer's freed activations stay cached by PyTorch; hand them back before vLLM
     # reclaims its weights and KV cache, or the wake-up runs out of memory.
     torch.cuda.empty_cache()
     llm.wake_up()
+    handoff_s = time.perf_counter() - t
     try:
-        return llm.chat(
+        outs = llm.chat(
             [t.messages for t in tasks],
             sampling_params=vllm.SamplingParams(n=n, temperature=temperature, max_tokens=cfg.max_new_tokens),
             lora_request=lora_request,
             use_tqdm=False,
         )
     finally:
+        t = time.perf_counter()
         llm.sleep(level=1)
+        handoff_s += time.perf_counter() - t
+    return outs, handoff_s
 
 
 async def grade_all(judge: Judge, pairs: list[tuple[Task, str]], concurrency: int):
@@ -155,12 +163,14 @@ async def grade_all(judge: Judge, pairs: list[tuple[Task, str]], concurrency: in
 # --- GRPO (from rl-experiments/train.py) -------------------------------------------------------
 
 
-def group_relative_advantages(rewards, num_prompts, group_size, eps=1e-6):
-    """(r - mean) / (std + eps) within each prompt's group; tied groups get exactly 0."""
+def group_relative_advantages(rewards, num_prompts, group_size, min_spread: float):
+    """r - mean within each prompt's group, as prime-rl does ("Dr. GRPO": no division by the group's
+    std, which would blow a decision judge's near-tied continuous scores up into full-size advantages
+    while a chat judge's whole-point scores tie exactly). Groups spanning less than min_spread get 0."""
     grouped = rewards.view(num_prompts, group_size)
-    advantages = (grouped - grouped.mean(1, keepdim=True)) / (grouped.std(1, keepdim=True) + eps)
-    tied = grouped.max(1, keepdim=True).values == grouped.min(1, keepdim=True).values
-    return torch.where(tied, 0.0, advantages).reshape(-1)
+    advantages = grouped - grouped.mean(1, keepdim=True)
+    spread = grouped.max(1, keepdim=True).values - grouped.min(1, keepdim=True).values
+    return torch.where(spread < max(min_spread, 1e-9), 0.0, advantages).reshape(-1)
 
 
 def iter_micro_batches(rows, lengths, budget_tokens):
@@ -240,7 +250,7 @@ def evaluate(step, llm, panel, tasks, cfg, lora_request, loop, out_dir: Path) ->
     """Greedy replies to held-out prompts, graded by every judge. Saves each reply with all judge
     scores to eval_step_<step>.jsonl and returns eval/* metrics."""
     t = time.perf_counter()
-    outs = generate(llm, tasks, 1, 0.0, cfg, lora_request)
+    outs, _ = generate(llm, tasks, 1, 0.0, cfg, lora_request)
     replies = [o.outputs[0].text for o in outs]
     async def grade_panel():  # gather inside a coroutine, so its future belongs to `loop`
         return await asyncio.gather(*(
@@ -332,7 +342,7 @@ def train(cfg: Config) -> None:
         torch.cuda.reset_peak_memory_stats()
         batch = next(prompt_batches)
         t = time.perf_counter()
-        outs = generate(llm, batch, cfg.group_size, cfg.temperature, cfg, lora_request)
+        outs, handoff_s = generate(llm, batch, cfg.group_size, cfg.temperature, cfg, lora_request)
         gen_s = time.perf_counter() - t
 
         flat = [(task, out, c) for task, out in zip(batch, outs) for c in out.outputs]
@@ -346,7 +356,7 @@ def train(cfg: Config) -> None:
         failed = torch.tensor([g is None for g in graded])
         rewards = torch.tensor([0.0 if g is None else g[0] for g in graded])
 
-        advantages = group_relative_advantages(rewards, len(batch), cfg.group_size)
+        advantages = group_relative_advantages(rewards, len(batch), cfg.group_size, cfg.min_group_spread)
         # A failed judge call would poison its group's baseline, so the whole group sits out.
         group_failed = failed.view(len(batch), cfg.group_size).any(1, keepdim=True).expand(-1, cfg.group_size)
         advantages = torch.where(group_failed.reshape(-1), 0.0, advantages)
@@ -402,6 +412,7 @@ def train(cfg: Config) -> None:
             "judge/latency_s": statistics.median(g[1][f"{reward_judge.name}/latency_s"] for g in ok) if ok else float("nan"),
             "judge/cost": sum(g[1].get(f"{reward_judge.name}/cost", 0.0) for g in ok),
             "perf/gen_s": gen_s,
+            "perf/handoff_s": handoff_s,
             "perf/score_s": score_s,
             "perf/sync_s": sync_s,
             "perf/step_s": time.perf_counter() - t_step,
@@ -435,6 +446,10 @@ def train(cfg: Config) -> None:
             shutil.rmtree(ckpt, ignore_errors=True)
             tmp.rename(ckpt)
 
+    # Exiting with the engine asleep makes vLLM's teardown fail on its offloaded memory, which
+    # would mark a finished run as failed.
+    torch.cuda.empty_cache()
+    llm.wake_up()
     if cfg.use_wandb:
         wandb.finish()
 
